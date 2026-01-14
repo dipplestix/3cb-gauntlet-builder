@@ -71,11 +71,18 @@ def get_card_image_url(card_name: str) -> Optional[str]:
     return None
 
 
-def display_deck(deck_name: str, label: str, goldfish: str = None):
+def display_deck(deck_name: str, label: str, goldfish: str = None, inverse_result: int = None):
     """Display a deck's cards with images."""
-    # Show label with goldfish turn as a badge
+    # Show label with goldfish turn as a badge, and inverse result icon
+    badges = []
     if goldfish:
-        st.markdown(f"**{label}** · <span style='background:#444; color:#fff; padding:2px 8px; border-radius:10px; font-size:0.85rem;'>🐟{goldfish}</span>", unsafe_allow_html=True)
+        badges.append(f"<span style='background:#444; color:#fff; padding:2px 8px; border-radius:10px; font-size:0.85rem;'>🐟{goldfish}</span>")
+    if inverse_result is not None:
+        inverse_icon = {2: "🟢", 1: "🟡", 0: "🔴"}.get(inverse_result, "")
+        badges.append(f"<span style='font-size:0.85rem;' title='Result when on draw'>{inverse_icon}</span>")
+
+    if badges:
+        st.markdown(f"**{label}** · {' '.join(badges)}", unsafe_allow_html=True)
     else:
         st.markdown(f"**{label}**")
     cards = [c.strip() for c in deck_name.split('|')]
@@ -130,7 +137,7 @@ def main():
             # Google Sheet URL
             sheet_url = st.text_input(
                 "Google Sheet URL",
-                value="",
+                value="https://docs.google.com/spreadsheets/d/1i9FWfoi6uyn6uL96hUJr8JY2_y5SBvhYUfxia0FE3U4/edit?usp=sharing",
                 help="Paste the full URL of your Google Sheet"
             )
 
@@ -284,6 +291,11 @@ def main():
         filter_changed = st.session_state.get('last_filter') != st.session_state.filter_mode
 
         if need_refresh or filter_changed or not st.session_state.matchups:
+            # Reset to first matchup when switching to unscored or accepted
+            if filter_changed and st.session_state.filter_mode in ('unscored', 'accepted'):
+                st.session_state.current_matchup_idx = 0
+                st.session_state.prev_deck_selection = '(all)'
+
             if st.session_state.filter_mode == 'unscored':
                 matchups = manager.get_unscored_matchups(scorer)
             elif st.session_state.filter_mode == 'accepted':
@@ -404,8 +416,25 @@ def main():
     left_col, right_col = st.columns([2, 1])
 
     with left_col:
-        # Display decks stacked with goldfish
-        display_deck(deck1, "Player 1 (On the Play)", goldfish1)
+        # Get inverse matchup score (deck2 on play vs deck1 on draw)
+        # Check scorer's result first, then fall back to accepted result
+        inverse_score = manager.get_matchup_result(deck2, deck1, scorer)
+        if inverse_score is None:
+            # Check for accepted result
+            try:
+                df = manager.read_results()
+                mask = (df['Deck1_OnPlay'] == deck2) & (df['Deck2_OnDraw'] == deck1)
+                if mask.any() and 'Accepted' in df.columns:
+                    accepted_val = df.loc[mask, 'Accepted'].values[0]
+                    if accepted_val != '':
+                        inverse_score = int(accepted_val)
+            except Exception:
+                pass
+        # Invert to show how deck1 does when on draw: 2 - score
+        deck1_on_draw = (2 - inverse_score) if inverse_score is not None else None
+
+        # Display decks stacked with goldfish and inverse result for deck1
+        display_deck(deck1, "Player 1 (On the Play)", goldfish1, deck1_on_draw)
 
         # Swap button to view inverse matchup
         vs_col1, vs_col2, vs_col3 = st.columns([2, 1, 2])
