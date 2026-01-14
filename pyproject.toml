@@ -1,0 +1,17 @@
+[project]
+name = "3cb-gauntlet-builder"
+version = "1.0.0"
+description = "A Streamlit app for scoring 3CB deck matchups with Google Sheets integration"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "google-auth>=2.0.0",
+    "gspread>=5.0.0",
+    "numpy>=1.20.0",
+    "pandas>=2.0.0",
+    "requests>=2.25.0",
+    "streamlit>=1.20.0",
+]
+
+[project.scripts]
+gauntlet = "streamlit:run"
