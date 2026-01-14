@@ -262,6 +262,23 @@ def main():
                 except Exception as e:
                     st.error(f"Failed to initialize: {e}")
 
+            if st.button("Import Swift Scores"):
+                try:
+                    with st.spinner("Importing Swift scores..."):
+                        counts = st.session_state.sheets_manager.import_swift_scores()
+                    st.success(f"Imported {counts['imported']} scores!")
+                    if counts['skipped_ambiguous'] > 0:
+                        st.info(f"Checked {counts['skipped_ambiguous']} ambiguous (total=2) matchups for sum validation")
+                    if counts['sum_mismatches'] > 0:
+                        st.error(f"Found {counts['sum_mismatches']} sum mismatches (flagged as discrepancies)")
+                    if counts['skipped_missing'] > 0:
+                        st.warning(f"Missing data for {counts['skipped_missing']} matchups")
+                    st.session_state.sheets_manager.invalidate_cache()
+                    st.session_state.matchups = []
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Failed to import Swift: {e}")
+
     # Main content
     if not st.session_state.connected:
         st.info("Please connect to a Google Sheet using the sidebar.")

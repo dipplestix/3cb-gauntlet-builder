@@ -9,6 +9,8 @@ from urllib.parse import quote
 
 # Path to history.csv (UTF-16 encoded)
 HISTORY_CSV_PATH = os.path.join(os.path.dirname(__file__), 'data', 'history.csv')
+# Path to swift.csv
+SWIFT_CSV_PATH = os.path.join(os.path.dirname(__file__), 'data', 'swift.csv')
 
 
 def normalize_deck(deck: str) -> str:
@@ -87,6 +89,178 @@ class HistoryLookup:
     def reload(self):
         """Reload history from disk."""
         self._load_history()
+
+
+class SwiftLookup:
+    """
+    Lookup matchup results from swift.csv matrix.
+
+    Swift scoring system:
+    - 4 = Win on Play (2) + Win on Draw (2)
+    - 3 = Win on Play (2) + Tie on Draw (1)
+    - 1 = Tie on Play (1) + Loss on Draw (0)
+    - 0 = Loss on Play (0) + Loss on Draw (0)
+    - 2 = Ambiguous: could be Win+Loss (2+0) or Tie+Tie (1+1)
+
+    For score=2, we can't determine individual play/draw results,
+    so we return None for those but can validate the sum.
+    """
+
+    _instance = None
+    _cache = None
+
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def __init__(self):
+        self._load_swift()
+
+    def _load_swift(self):
+        """Load and index swift.csv matrix."""
+        self._cache = {}  # (deck1, deck2) -> {'total': int, 'on_play': int or None, 'on_draw': int or None}
+
+        if not os.path.exists(SWIFT_CSV_PATH):
+            return
+
+        try:
+            # Read the CSV
+            with open(SWIFT_CSV_PATH, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            if len(lines) < 6:
+                return
+
+            # Row 0 has deck names starting at column 8
+            header_line = lines[0].strip()
+            # Parse CSV properly handling quoted fields
+            import csv
+            reader = csv.reader([header_line])
+            header_row = list(reader)[0]
+
+            # Deck names start at column 8 (0-indexed)
+            deck_columns = header_row[8:]
+
+            # Clean up deck names (remove 'test:' prefix if present)
+            deck_columns = [d.replace('test: ', '').strip() for d in deck_columns]
+
+            # Data rows start at row 5 (0-indexed), after header rows
+            data_start = 5
+
+            for line in lines[data_start:]:
+                if not line.strip():
+                    continue
+
+                reader = csv.reader([line])
+                row = list(reader)[0]
+
+                if len(row) < 9:
+                    continue
+
+                # Column 1 has the deck name for this row
+                row_deck = row[1].strip()
+                if not row_deck or row_deck.startswith('test:'):
+                    # Skip test decks
+                    if row_deck.startswith('test:'):
+                        row_deck = row_deck.replace('test: ', '').strip()
+                    else:
+                        continue
+
+                # Normalize the row deck name
+                row_deck_norm = normalize_deck(row_deck)
+
+                # Scores start at column 8
+                for j, score_str in enumerate(row[8:]):
+                    if j >= len(deck_columns):
+                        break
+
+                    col_deck = deck_columns[j]
+                    if not col_deck:
+                        continue
+
+                    col_deck_norm = normalize_deck(col_deck)
+
+                    # Skip mirrors
+                    if row_deck_norm == col_deck_norm:
+                        continue
+
+                    score_str = score_str.strip()
+                    if not score_str or score_str == '-1':
+                        continue
+
+                    try:
+                        total = int(score_str)
+                    except ValueError:
+                        continue
+
+                    if total < 0 or total > 4:
+                        continue
+
+                    # Determine individual play/draw scores
+                    # Row deck is on play vs column deck
+                    if total == 4:
+                        on_play, on_draw = 2, 2  # W, W
+                    elif total == 3:
+                        on_play, on_draw = 2, 1  # W, T
+                    elif total == 1:
+                        on_play, on_draw = 1, 0  # T, L
+                    elif total == 0:
+                        on_play, on_draw = 0, 0  # L, L
+                    elif total == 2:
+                        # Ambiguous - could be W+L or T+T
+                        on_play, on_draw = None, None
+                    else:
+                        continue
+
+                    # Store: row_deck on play vs col_deck
+                    key = (row_deck_norm, col_deck_norm)
+                    self._cache[key] = {
+                        'total': total,
+                        'on_play': on_play,
+                        'on_draw': on_draw
+                    }
+
+        except Exception as e:
+            print(f"Error loading swift.csv: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def lookup(self, deck1_on_play: str, deck2_on_draw: str) -> Optional[Dict]:
+        """
+        Look up Swift's result for a matchup.
+
+        Args:
+            deck1_on_play: Deck that is on play
+            deck2_on_draw: Deck that is on draw
+
+        Returns:
+            Dict with 'total', 'on_play', 'on_draw' or None if not found.
+            For score=2 matchups, on_play and on_draw will be None.
+        """
+        key = (normalize_deck(deck1_on_play), normalize_deck(deck2_on_draw))
+        return self._cache.get(key)
+
+    def lookup_on_play(self, deck1_on_play: str, deck2_on_draw: str) -> Optional[int]:
+        """
+        Look up Swift's on-play result for a matchup.
+
+        Returns:
+            0=Loss, 1=Tie, 2=Win from deck1's perspective, or None if not found/ambiguous.
+        """
+        result = self.lookup(deck1_on_play, deck2_on_draw)
+        if result is None:
+            return None
+        return result.get('on_play')
+
+    def get_all_matchups(self) -> List[Tuple[str, str, Dict]]:
+        """Get all matchups with their scores."""
+        return [(k[0], k[1], v) for k, v in self._cache.items()]
+
+    def reload(self):
+        """Reload swift data from disk."""
+        self._load_swift()
 
 
 SCOPES = [
@@ -460,6 +634,244 @@ class SheetsManager:
             sheet.batch_update(updates, value_input_option='USER_ENTERED')
 
         # Invalidate cache
+        self.invalidate_cache()
+
+    def import_swift_scores(self) -> Dict[str, int]:
+        """
+        Import Swift scores from swift.csv as a scorer column.
+
+        Swift is treated as another scorer that can generate discrepancies,
+        but NOT as an accepted/authoritative result.
+
+        For matchups with total=2 (ambiguous WL or TT), no individual
+        play/draw scores are written, but we validate that the sum matches.
+
+        Returns:
+            Dict with counts: 'imported', 'skipped_ambiguous', 'skipped_missing', 'sum_mismatches'
+        """
+        swift = SwiftLookup.get_instance()
+        swift.reload()  # Ensure we have latest data
+
+        sheet = self._get_or_create_sheet(RESULTS_SHEET)
+        headers = sheet.row_values(1)
+
+        # Ensure Swift column exists
+        scorer_name = 'Swift'
+        if scorer_name not in headers:
+            self.add_scorer_column(scorer_name)
+            headers = sheet.row_values(1)
+
+        swift_col_idx = headers.index(scorer_name) + 1  # 1-indexed
+
+        # Read all results data
+        df = self.read_results(force_refresh=True)
+
+        counts = {'imported': 0, 'skipped_ambiguous': 0, 'skipped_missing': 0, 'sum_mismatches': 0}
+        updates = []
+
+        for idx, row in df.iterrows():
+            deck1 = row.get('Deck1_OnPlay', '')
+            deck2 = row.get('Deck2_OnDraw', '')
+
+            if not deck1 or not deck2:
+                continue
+
+            # Skip mirrors
+            if normalize_deck(deck1) == normalize_deck(deck2):
+                continue
+
+            row_idx = idx + 2  # +2 for 1-indexing and header
+
+            # Look up Swift's score for this matchup
+            swift_result = swift.lookup(deck1, deck2)
+
+            if swift_result is None:
+                counts['skipped_missing'] += 1
+                continue
+
+            on_play_score = swift_result.get('on_play')
+
+            if on_play_score is None:
+                # Ambiguous (total=2) - skip individual scoring
+                counts['skipped_ambiguous'] += 1
+                continue
+
+            # Write the on-play score
+            updates.append({
+                'range': gspread.utils.rowcol_to_a1(row_idx, swift_col_idx),
+                'values': [[str(on_play_score)]]
+            })
+            counts['imported'] += 1
+
+        if updates:
+            # Batch update in chunks to avoid API limits
+            chunk_size = 500
+            for i in range(0, len(updates), chunk_size):
+                chunk = updates[i:i + chunk_size]
+                sheet.batch_update(chunk, value_input_option='USER_ENTERED')
+
+        # Update consensus/discrepancy for all rows
+        self.invalidate_cache()
+
+        # Now update consensus and discrepancy columns
+        self._update_all_consensus_discrepancy()
+
+        # Validate ambiguous matchups (total=2) - check if sum matches
+        sum_mismatches = self.validate_swift_ambiguous_sums()
+        counts['sum_mismatches'] = sum_mismatches
+
+        return counts
+
+    def validate_swift_ambiguous_sums(self) -> int:
+        """
+        Validate that ambiguous Swift matchups (total=2) have matching sums.
+
+        For each matchup where Swift has total=2:
+        - Get the on-play result from Results (Accepted or Consensus)
+        - Get the on-draw result (from inverse matchup)
+        - Check if on_play + on_draw == 2
+        - If not, flag as discrepancy
+
+        Returns:
+            Number of sum mismatches found.
+        """
+        swift = SwiftLookup.get_instance()
+        df = self.read_results(force_refresh=True)
+
+        if df.empty:
+            return 0
+
+        sheet = self._get_or_create_sheet(RESULTS_SHEET)
+        headers = sheet.row_values(1)
+
+        # Find Discrepancy column
+        try:
+            discrepancy_col = headers.index('Discrepancy') + 1
+        except ValueError:
+            return 0
+
+        # Build lookup for results: (deck1, deck2) -> result
+        results_lookup = {}
+        row_lookup = {}  # (deck1, deck2) -> row_idx
+        for idx, row in df.iterrows():
+            d1 = normalize_deck(row.get('Deck1_OnPlay', ''))
+            d2 = normalize_deck(row.get('Deck2_OnDraw', ''))
+            # Use Accepted if available, otherwise Consensus
+            result = row.get('Accepted', '')
+            if result == '':
+                result = row.get('Consensus', '')
+            if d1 and d2 and result != '':
+                try:
+                    results_lookup[(d1, d2)] = int(result)
+                except ValueError:
+                    pass
+            if d1 and d2:
+                row_lookup[(d1, d2)] = idx + 2  # +2 for 1-indexing and header
+
+        mismatch_count = 0
+        updates = []
+
+        # Check all ambiguous Swift matchups
+        for d1, d2, swift_data in swift.get_all_matchups():
+            if swift_data['total'] != 2:
+                continue  # Only check ambiguous ones
+
+            d1_norm = normalize_deck(d1)
+            d2_norm = normalize_deck(d2)
+
+            # Get on-play result (d1 on play vs d2)
+            on_play = results_lookup.get((d1_norm, d2_norm))
+
+            # Get on-draw result (d1 on draw vs d2)
+            # This is 2 - (d2's result when on play vs d1)
+            d2_on_play_vs_d1 = results_lookup.get((d2_norm, d1_norm))
+            on_draw = (2 - d2_on_play_vs_d1) if d2_on_play_vs_d1 is not None else None
+
+            # Check if both results exist
+            if on_play is not None and on_draw is not None:
+                total = on_play + on_draw
+                if total != 2:
+                    # Sum mismatch - flag as discrepancy
+                    mismatch_count += 1
+                    row_idx = row_lookup.get((d1_norm, d2_norm))
+                    if row_idx:
+                        updates.append({
+                            'range': gspread.utils.rowcol_to_a1(row_idx, discrepancy_col),
+                            'values': [['TRUE']]
+                        })
+
+        if updates:
+            # Batch update in chunks
+            chunk_size = 500
+            for i in range(0, len(updates), chunk_size):
+                chunk = updates[i:i + chunk_size]
+                sheet.batch_update(chunk, value_input_option='USER_ENTERED')
+            self.invalidate_cache()
+
+        return mismatch_count
+
+    def _update_all_consensus_discrepancy(self):
+        """Update Consensus and Discrepancy columns for all rows."""
+        sheet = self._get_or_create_sheet(RESULTS_SHEET)
+        data = sheet.get_all_values()
+
+        if len(data) < 2:
+            return
+
+        headers = data[0]
+
+        # Find column indices
+        try:
+            consensus_col = headers.index('Consensus') + 1
+            discrepancy_col = headers.index('Discrepancy') + 1
+        except ValueError:
+            return
+
+        # Find scorer columns (exclude fixed columns and Accepted)
+        fixed_cols = {'Deck1_OnPlay', 'Deck2_OnDraw', 'Consensus', 'Discrepancy', 'Accepted'}
+        scorer_indices = [i for i, h in enumerate(headers) if h and h not in fixed_cols]
+
+        updates = []
+
+        for row_idx, row in enumerate(data[1:], start=2):
+            # Pad row if needed
+            while len(row) < len(headers):
+                row.append('')
+
+            # Get scores from all scorers
+            scores = []
+            for idx in scorer_indices:
+                if idx < len(row) and row[idx].strip():
+                    try:
+                        scores.append(int(row[idx]))
+                    except ValueError:
+                        pass
+
+            # Compute consensus and discrepancy
+            if scores:
+                from collections import Counter
+                consensus = Counter(scores).most_common(1)[0][0]
+                discrepancy = len(set(scores)) > 1
+            else:
+                consensus = ''
+                discrepancy = ''
+
+            updates.append({
+                'range': gspread.utils.rowcol_to_a1(row_idx, consensus_col),
+                'values': [[str(consensus) if consensus != '' else '']]
+            })
+            updates.append({
+                'range': gspread.utils.rowcol_to_a1(row_idx, discrepancy_col),
+                'values': [[str(discrepancy).upper() if discrepancy != '' else '']]
+            })
+
+        if updates:
+            # Batch update in chunks
+            chunk_size = 1000
+            for i in range(0, len(updates), chunk_size):
+                chunk = updates[i:i + chunk_size]
+                sheet.batch_update(chunk, value_input_option='USER_ENTERED')
+
         self.invalidate_cache()
 
     def add_scorer_column(self, scorer_name: str):
