@@ -6,6 +6,88 @@ from typing import List, Dict, Optional, Tuple
 import os
 import time
 from urllib.parse import quote
+from collections import deque
+import functools
+
+
+class RateLimiter:
+    """
+    Rate limiter for Google Sheets API.
+
+    Google Sheets API limits:
+    - 300 write requests per minute per user
+    - 60 read requests per minute per user
+
+    We'll be conservative and limit to 50 requests per minute.
+    """
+
+    def __init__(self, max_requests: int = 50, time_window: int = 60):
+        self.max_requests = max_requests
+        self.time_window = time_window  # seconds
+        self.requests = deque()
+
+    def wait_if_needed(self):
+        """Wait if we've exceeded the rate limit."""
+        now = time.time()
+
+        # Remove old requests outside the time window
+        while self.requests and self.requests[0] < now - self.time_window:
+            self.requests.popleft()
+
+        # If we're at the limit, wait until the oldest request expires
+        if len(self.requests) >= self.max_requests:
+            sleep_time = self.requests[0] - (now - self.time_window) + 0.1
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            # Clean up again after sleeping
+            now = time.time()
+            while self.requests and self.requests[0] < now - self.time_window:
+                self.requests.popleft()
+
+        # Record this request
+        self.requests.append(time.time())
+
+    def __call__(self, func):
+        """Decorator to rate-limit a function."""
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            self.wait_if_needed()
+            return func(*args, **kwargs)
+        return wrapper
+
+
+def retry_on_quota_error(max_retries: int = 3, initial_delay: float = 5.0):
+    """
+    Decorator to retry on quota exceeded errors with exponential backoff.
+    """
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except gspread.exceptions.APIError as e:
+                    if '429' in str(e) or 'Quota exceeded' in str(e):
+                        last_exception = e
+                        if attempt < max_retries:
+                            print(f"Rate limited, waiting {delay:.1f}s before retry {attempt + 1}/{max_retries}...")
+                            time.sleep(delay)
+                            delay *= 2  # Exponential backoff
+                        continue
+                    raise
+
+            # If we've exhausted retries, raise the last exception
+            if last_exception:
+                raise last_exception
+        return wrapper
+    return decorator
+
+
+# Global rate limiter instance
+_rate_limiter = RateLimiter(max_requests=40, time_window=60)
 
 # Path to history.csv (UTF-16 encoded)
 HISTORY_CSV_PATH = os.path.join(os.path.dirname(__file__), 'data', 'history.csv')
@@ -326,6 +408,34 @@ class SheetsManager:
         except gspread.WorksheetNotFound:
             return self.spreadsheet.add_worksheet(title=name, rows=rows, cols=cols)
 
+    @retry_on_quota_error(max_retries=5, initial_delay=10.0)
+    def _rate_limited_batch_update(self, sheet: gspread.Worksheet, updates: List[Dict], value_input_option: str = 'USER_ENTERED'):
+        """
+        Perform a rate-limited batch update with retry on quota errors.
+
+        Args:
+            sheet: The worksheet to update
+            updates: List of update dicts with 'range' and 'values'
+            value_input_option: How to interpret input data
+        """
+        _rate_limiter.wait_if_needed()
+        sheet.batch_update(updates, value_input_option=value_input_option)
+
+    def _chunked_batch_update(self, sheet: gspread.Worksheet, updates: List[Dict],
+                               chunk_size: int = 100, value_input_option: str = 'USER_ENTERED'):
+        """
+        Perform batch updates in chunks with rate limiting.
+
+        Args:
+            sheet: The worksheet to update
+            updates: List of update dicts with 'range' and 'values'
+            chunk_size: Number of updates per batch (smaller = safer for rate limits)
+            value_input_option: How to interpret input data
+        """
+        for i in range(0, len(updates), chunk_size):
+            chunk = updates[i:i + chunk_size]
+            self._rate_limited_batch_update(sheet, chunk, value_input_option)
+
     # =========================================================================
     # Decks Sheet Operations
     # =========================================================================
@@ -423,7 +533,7 @@ class SheetsManager:
             })
 
         if updates:
-            sheet.batch_update(updates, value_input_option='USER_ENTERED')
+            self._chunked_batch_update(sheet, updates)
 
     def normalize_all_deck_names(self):
         """
@@ -450,7 +560,7 @@ class SheetsManager:
                         })
 
             if decks_updates:
-                decks_sheet.batch_update(decks_updates, value_input_option='USER_ENTERED')
+                self._chunked_batch_update(decks_sheet, decks_updates)
 
         # Normalize Results sheet
         results_sheet = self._get_or_create_sheet(RESULTS_SHEET)
@@ -478,7 +588,7 @@ class SheetsManager:
                         })
 
             if results_updates:
-                results_sheet.batch_update(results_updates, value_input_option='USER_ENTERED')
+                self._chunked_batch_update(results_sheet, results_updates)
 
         self.invalidate_cache()
 
@@ -631,7 +741,7 @@ class SheetsManager:
                 })
 
         if updates:
-            sheet.batch_update(updates, value_input_option='USER_ENTERED')
+            self._chunked_batch_update(sheet, updates)
 
         # Invalidate cache
         self.invalidate_cache()
@@ -712,11 +822,7 @@ class SheetsManager:
             counts['imported'] += 1
 
         if updates:
-            # Batch update in chunks to avoid API limits
-            chunk_size = 500
-            for i in range(0, len(updates), chunk_size):
-                chunk = updates[i:i + chunk_size]
-                sheet.batch_update(chunk, value_input_option='USER_ENTERED')
+            self._chunked_batch_update(sheet, updates)
 
         # Update consensus/discrepancy for all rows
         self.invalidate_cache()
@@ -809,11 +915,7 @@ class SheetsManager:
                         })
 
         if updates:
-            # Batch update in chunks
-            chunk_size = 500
-            for i in range(0, len(updates), chunk_size):
-                chunk = updates[i:i + chunk_size]
-                sheet.batch_update(chunk, value_input_option='USER_ENTERED')
+            self._chunked_batch_update(sheet, updates)
             self.invalidate_cache()
 
         return mismatch_count
@@ -874,11 +976,7 @@ class SheetsManager:
             })
 
         if updates:
-            # Batch update in chunks
-            chunk_size = 1000
-            for i in range(0, len(updates), chunk_size):
-                chunk = updates[i:i + chunk_size]
-                sheet.batch_update(chunk, value_input_option='USER_ENTERED')
+            self._chunked_batch_update(sheet, updates)
 
         self.invalidate_cache()
 
@@ -1231,7 +1329,7 @@ class SheetsManager:
                             })
 
         if updates:
-            sheet.batch_update(updates, value_input_option='USER_ENTERED')
+            self._chunked_batch_update(sheet, updates)
             self.invalidate_cache()
 
         return discrepancy_count
@@ -1410,6 +1508,7 @@ class SheetsManager:
                             })
 
             if format_requests:
+                _rate_limiter.wait_if_needed()
                 sheet.batch_format(format_requests)
 
     def update_decks_nash_weights(self, nash_weights: Dict[str, float]):
@@ -1478,8 +1577,10 @@ class SheetsManager:
             })
 
         if updates:
-            sheet.batch_update(updates, value_input_option='USER_ENTERED')
+            self._chunked_batch_update(sheet, updates)
         if format_requests:
+            # Rate limit format requests too
+            _rate_limiter.wait_if_needed()
             sheet.batch_format(format_requests)
 
     def compute_and_update_nash(self) -> Dict:
