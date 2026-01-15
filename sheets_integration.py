@@ -669,6 +669,8 @@ class SheetsManager:
         counts = {'imported': 0, 'skipped_ambiguous': 0, 'skipped_missing': 0, 'sum_mismatches': 0}
         updates = []
 
+        counts['skipped_existing'] = 0
+
         for idx, row in df.iterrows():
             deck1 = row.get('Deck1_OnPlay', '')
             deck2 = row.get('Deck2_OnDraw', '')
@@ -678,6 +680,12 @@ class SheetsManager:
 
             # Skip mirrors
             if normalize_deck(deck1) == normalize_deck(deck2):
+                continue
+
+            # Skip if Swift column already has a value
+            existing_swift = row.get('Swift', '')
+            if existing_swift != '':
+                counts['skipped_existing'] += 1
                 continue
 
             row_idx = idx + 2  # +2 for 1-indexing and header
@@ -1067,6 +1075,9 @@ class SheetsManager:
         if df.empty or not decks:
             return
 
+        # Load Swift data for fallback
+        swift = SwiftLookup.get_instance()
+
         # Create matrices
         n = len(decks)
         deck_to_idx = {d: i for i, d in enumerate(decks)}
@@ -1084,7 +1095,7 @@ class SheetsManager:
             matrix_ondraw[0][i + 1] = deck
             matrix_ondraw[i + 1][0] = deck
 
-        # Fill in results from Accepted column first, then Consensus
+        # Fill in results from Accepted column first, then Consensus, then Swift
         for _, row in df.iterrows():
             d1 = row.get('Deck1_OnPlay', '')
             d2 = row.get('Deck2_OnDraw', '')
@@ -1093,6 +1104,12 @@ class SheetsManager:
             result = row.get('Accepted', '')
             if result == '':
                 result = row.get('Consensus', '')
+
+            # Fall back to Swift if no Accepted or Consensus
+            if result == '':
+                swift_result = swift.lookup_on_play(d1, d2)
+                if swift_result is not None:
+                    result = str(swift_result)
 
             if d1 in deck_to_idx and d2 in deck_to_idx and result != '':
                 i = deck_to_idx[d1]
