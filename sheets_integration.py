@@ -422,7 +422,8 @@ class SheetsManager:
         sheet.batch_update(updates, value_input_option=value_input_option)
 
     def _chunked_batch_update(self, sheet: gspread.Worksheet, updates: List[Dict],
-                               chunk_size: int = 100, value_input_option: str = 'USER_ENTERED'):
+                               chunk_size: int = 100, value_input_option: str = 'USER_ENTERED',
+                               progress_callback=None, progress_start: int = 50, progress_end: int = 90):
         """
         Perform batch updates in chunks with rate limiting.
 
@@ -431,9 +432,16 @@ class SheetsManager:
             updates: List of update dicts with 'range' and 'values'
             chunk_size: Number of updates per batch (smaller = safer for rate limits)
             value_input_option: How to interpret input data
+            progress_callback: Optional callback(current, total, status_text) for progress
+            progress_start: Starting progress percentage
+            progress_end: Ending progress percentage
         """
-        for i in range(0, len(updates), chunk_size):
-            chunk = updates[i:i + chunk_size]
+        total_chunks = (len(updates) + chunk_size - 1) // chunk_size
+        for i, start in enumerate(range(0, len(updates), chunk_size)):
+            chunk = updates[start:start + chunk_size]
+            if progress_callback:
+                pct = progress_start + int((i / total_chunks) * (progress_end - progress_start))
+                progress_callback(pct, 100, f"Writing batch {i+1}/{total_chunks}...")
             self._rate_limited_batch_update(sheet, chunk, value_input_option)
 
     # =========================================================================
@@ -746,7 +754,7 @@ class SheetsManager:
         # Invalidate cache
         self.invalidate_cache()
 
-    def import_swift_scores(self) -> Dict[str, int]:
+    def import_swift_scores(self, progress_callback=None) -> Dict[str, int]:
         """
         Import Swift scores from swift.csv as a scorer column.
 
@@ -756,11 +764,17 @@ class SheetsManager:
         For matchups with total=2 (ambiguous WL or TT), no individual
         play/draw scores are written, but we validate that the sum matches.
 
+        Args:
+            progress_callback: Optional callback(current, total, status_text) for progress updates
+
         Returns:
             Dict with counts: 'imported', 'skipped_ambiguous', 'skipped_missing', 'sum_mismatches'
         """
         swift = SwiftLookup.get_instance()
         swift.reload()  # Ensure we have latest data
+
+        if progress_callback:
+            progress_callback(0, 100, "Loading sheet data...")
 
         sheet = self._get_or_create_sheet(RESULTS_SHEET)
         headers = sheet.row_values(1)
@@ -775,6 +789,10 @@ class SheetsManager:
 
         # Read all results data
         df = self.read_results(force_refresh=True)
+        total_rows = len(df)
+
+        if progress_callback:
+            progress_callback(5, 100, "Processing matchups...")
 
         counts = {'imported': 0, 'skipped_ambiguous': 0, 'skipped_missing': 0, 'sum_mismatches': 0}
         updates = []
@@ -782,6 +800,11 @@ class SheetsManager:
         counts['skipped_existing'] = 0
 
         for idx, row in df.iterrows():
+            # Update progress every 100 rows
+            if progress_callback and idx % 100 == 0:
+                pct = 5 + int((idx / total_rows) * 40)  # 5-45% for processing
+                progress_callback(pct, 100, f"Processing matchups ({idx}/{total_rows})...")
+
             deck1 = row.get('Deck1_OnPlay', '')
             deck2 = row.get('Deck2_OnDraw', '')
 
@@ -822,17 +845,29 @@ class SheetsManager:
             counts['imported'] += 1
 
         if updates:
-            self._chunked_batch_update(sheet, updates)
+            if progress_callback:
+                progress_callback(50, 100, f"Writing {len(updates)} scores to sheet...")
+            self._chunked_batch_update(sheet, updates, progress_callback=progress_callback,
+                                       progress_start=50, progress_end=80)
 
         # Update consensus/discrepancy for all rows
         self.invalidate_cache()
 
+        if progress_callback:
+            progress_callback(85, 100, "Updating consensus...")
+
         # Now update consensus and discrepancy columns
         self._update_all_consensus_discrepancy()
+
+        if progress_callback:
+            progress_callback(95, 100, "Validating sums...")
 
         # Validate ambiguous matchups (total=2) - check if sum matches
         sum_mismatches = self.validate_swift_ambiguous_sums()
         counts['sum_mismatches'] = sum_mismatches
+
+        if progress_callback:
+            progress_callback(100, 100, "Done!")
 
         return counts
 
@@ -1755,3 +1790,27 @@ class SheetsManager:
                         break
 
         return discrepant_matchups
+
+    def get_unscored_by_swift_matchups(self) -> List[Tuple[str, str]]:
+        """Get list of matchups that don't have a Swift score (including ambiguous)."""
+        df = self.read_results()
+        swift = SwiftLookup.get_instance()
+
+        unscored = []
+        for _, row in df.iterrows():
+            deck1 = row.get('Deck1_OnPlay', '')
+            deck2 = row.get('Deck2_OnDraw', '')
+
+            if not deck1 or not deck2:
+                continue
+
+            # Skip mirrors
+            if normalize_deck(deck1) == normalize_deck(deck2):
+                continue
+
+            # Check if Swift has a score for this matchup
+            swift_result = swift.lookup(deck1, deck2)
+            if swift_result is None:
+                unscored.append((deck1, deck2))
+
+        return unscored

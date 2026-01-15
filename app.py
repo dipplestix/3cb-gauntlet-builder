@@ -184,12 +184,13 @@ def main():
             st.header("Filter")
             filter_mode = st.radio(
                 "Show matchups:",
-                ['all', 'unscored', 'accepted', 'discrepancies'],
+                ['all', 'unscored', 'accepted', 'discrepancies', 'unscored_swift'],
                 format_func=lambda x: {
                     'all': 'All matchups',
                     'unscored': 'Unscored only (by me)',
                     'accepted': 'Accepted (from history)',
-                    'discrepancies': 'Discrepancies only'
+                    'discrepancies': 'Discrepancies only',
+                    'unscored_swift': 'Unscored by Swift'
                 }[x]
             )
             st.session_state.filter_mode = filter_mode
@@ -264,8 +265,19 @@ def main():
 
             if st.button("Import Swift Scores"):
                 try:
-                    with st.spinner("Importing Swift scores..."):
-                        counts = st.session_state.sheets_manager.import_swift_scores()
+                    progress_bar = st.progress(0, text="Starting import...")
+                    status_text = st.empty()
+
+                    def update_progress(current, total, text):
+                        progress_bar.progress(current / total, text=text)
+                        status_text.text(text)
+
+                    counts = st.session_state.sheets_manager.import_swift_scores(
+                        progress_callback=update_progress
+                    )
+                    progress_bar.empty()
+                    status_text.empty()
+
                     st.success(f"Imported {counts['imported']} new scores!")
                     if counts.get('skipped_existing', 0) > 0:
                         st.info(f"Skipped {counts['skipped_existing']} already populated")
@@ -321,6 +333,8 @@ def main():
                 matchups = manager.get_accepted_matchups(scorer)
             elif st.session_state.filter_mode == 'discrepancies':
                 matchups = manager.get_discrepant_matchups()
+            elif st.session_state.filter_mode == 'unscored_swift':
+                matchups = manager.get_unscored_by_swift_matchups()
             else:
                 df = manager.read_results()
                 matchups = list(zip(df['Deck1_OnPlay'], df['Deck2_OnDraw']))
@@ -350,6 +364,8 @@ def main():
             st.success("You've scored all accepted matchups!")
         elif st.session_state.filter_mode == 'discrepancies':
             st.success("No discrepancies found!")
+        elif st.session_state.filter_mode == 'unscored_swift':
+            st.success("All matchups have Swift scores!")
         else:
             st.warning("No matchups found. Click 'Initialize Results Sheet' in the sidebar.")
         return
