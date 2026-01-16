@@ -57,10 +57,10 @@ def rnad_replicator_step(x: np.ndarray, y: np.ndarray, M: np.ndarray,
 def compute_nash_equilibrium(payoff_matrix: np.ndarray,
                              num_restarts: int = 1,
                              inner_steps: int = 1000,
-                             max_outer_iters: int = 1000,
+                             max_outer_iters: int = 10000,
                              eta: float = 0.2,
-                             dt: float = 0.02,
-                             tol: float = 1e-5
+                             dt: float = 0.1,
+                             tol: float = 1e-7
                              ) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Compute Nash equilibrium of a zero-sum game using R-NAD with annealing.

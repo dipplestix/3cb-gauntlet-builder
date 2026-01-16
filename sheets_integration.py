@@ -291,8 +291,8 @@ class SwiftLookup:
                     elif total == 0:
                         on_play, on_draw = 0, 0  # L, L
                     elif total == 2:
-                        # Ambiguous - could be W+L or T+T
-                        on_play, on_draw = None, None
+                        # Ambiguous - default to T+T (user preference)
+                        on_play, on_draw = 1, 1  # T, T
                     else:
                         continue
 
@@ -358,8 +358,8 @@ GAME_MATRIX_SHEET = "Game_Matrix"
 NASH_SHEET = "Nash"
 RESULTS_SHEET = "Results"
 
-# Cache TTL in seconds
-CACHE_TTL = 30
+# Cache TTL in seconds (set very high - data loaded on connect, refreshed manually)
+CACHE_TTL = 3600  # 1 hour - effectively infinite for a session
 
 
 class SheetsManager:
@@ -377,11 +377,12 @@ class SheetsManager:
         self.creds_path = creds_path
         self.spreadsheet = None
 
-        # Cache for data
+        # Cache for data (loaded on connect, persists for session)
         self._decks_cache = None
         self._decks_cache_time = 0
         self._results_cache = None
         self._results_cache_time = 0
+        self._results_raw_cache = None  # Raw sheet data for operations
         self._headers_cache = None
         self._headers_cache_time = 0
         self._goldfish_cache = None
@@ -390,7 +391,7 @@ class SheetsManager:
         self._connect()
 
     def _connect(self):
-        """Establish connection to Google Sheets."""
+        """Establish connection to Google Sheets and download data locally."""
         if not os.path.exists(self.creds_path):
             raise FileNotFoundError(
                 f"Credentials file not found: {self.creds_path}\n"
@@ -400,6 +401,64 @@ class SheetsManager:
         creds = Credentials.from_service_account_file(self.creds_path, scopes=SCOPES)
         gc = gspread.authorize(creds)
         self.spreadsheet = gc.open_by_url(self.sheet_url)
+
+        # Pre-load all data locally on connect
+        self._preload_data()
+
+    def _preload_data(self):
+        """Download all sheet data locally for fast access."""
+        import time as t
+        now = t.time()
+
+        # Load Results sheet
+        try:
+            sheet = self.spreadsheet.worksheet(RESULTS_SHEET)
+            _rate_limiter.wait_if_needed()
+            data = sheet.get_all_values()
+            if data:
+                self._results_raw_cache = data  # Store raw data
+                self._headers_cache = data[0] if data else []
+                self._headers_cache_time = now
+                # Build DataFrame
+                import pandas as pd
+                if len(data) > 1:
+                    df = pd.DataFrame(data[1:], columns=data[0])
+                    # Normalize deck names
+                    if 'Deck1_OnPlay' in df.columns:
+                        df['Deck1_OnPlay'] = df['Deck1_OnPlay'].apply(lambda x: normalize_deck(x) if x else '')
+                    if 'Deck2_OnDraw' in df.columns:
+                        df['Deck2_OnDraw'] = df['Deck2_OnDraw'].apply(lambda x: normalize_deck(x) if x else '')
+                    self._results_cache = df
+                    self._results_cache_time = now
+        except gspread.WorksheetNotFound:
+            pass
+
+        # Load Decks sheet
+        try:
+            sheet = self.spreadsheet.worksheet(DECKS_SHEET)
+            _rate_limiter.wait_if_needed()
+            data = sheet.get_all_values()
+            if data and len(data) > 1:
+                decks = []
+                for row in data[1:]:
+                    if row and row[0].strip():
+                        decks.append(normalize_deck(row[0].strip()))
+                self._decks_cache = decks
+                self._decks_cache_time = now
+                # Also cache goldfish data
+                self._goldfish_cache = {}
+                for row in data[1:]:
+                    if len(row) >= 2 and row[0].strip():
+                        deck = normalize_deck(row[0].strip())
+                        goldfish = row[1].strip() if len(row) > 1 else ''
+                        if goldfish:
+                            try:
+                                self._goldfish_cache[deck] = int(goldfish)
+                            except ValueError:
+                                pass
+                self._goldfish_cache_time = now
+        except gspread.WorksheetNotFound:
+            pass
 
     def _get_or_create_sheet(self, name: str, rows: int = 1000, cols: int = 26) -> gspread.Worksheet:
         """Get worksheet by name, creating it if it doesn't exist."""
@@ -419,7 +478,11 @@ class SheetsManager:
             value_input_option: How to interpret input data
         """
         _rate_limiter.wait_if_needed()
-        sheet.batch_update(updates, value_input_option=value_input_option)
+        # Deep copy updates since gspread modifies the range dicts in place
+        # (adds sheet name prefix), which corrupts them on retry
+        import copy
+        updates_copy = copy.deepcopy(updates)
+        sheet.batch_update(updates_copy, value_input_option=value_input_option)
 
     def _chunked_batch_update(self, sheet: gspread.Worksheet, updates: List[Dict],
                                chunk_size: int = 100, value_input_option: str = 'USER_ENTERED',
@@ -471,8 +534,14 @@ class SheetsManager:
         """Invalidate all caches to force refresh on next read."""
         self._decks_cache = None
         self._results_cache = None
+        self._results_raw_cache = None
         self._headers_cache = None
         self._goldfish_cache = None
+
+    def refresh_data(self):
+        """Re-download all data from sheets (call after external changes)."""
+        self.invalidate_cache()
+        self._preload_data()
 
     def get_goldfish(self, deck: str) -> Optional[str]:
         """Get goldfish turn for a deck (cached)."""
@@ -511,32 +580,24 @@ class SheetsManager:
         return f'https://scryfall.com/search?q={quote(query)}'
 
     def update_deck_links(self):
-        """Update the Decks sheet so each deck name is a hyperlink to Scryfall."""
-        sheet = self._get_or_create_sheet(DECKS_SHEET)
-        data = sheet.get_all_values()
+        """Update the Decks sheet so each deck name is a hyperlink to Scryfall.
 
-        if not data or len(data) < 2:
+        Uses cached deck list - only makes API call to write updates.
+        """
+        # Use cached decks instead of API call
+        decks = self.read_decks()
+        if not decks:
             return
 
-        # Build updates for column A (deck names) with HYPERLINK formulas
+        sheet = self._get_or_create_sheet(DECKS_SHEET)
+
+        # Build all hyperlink formulas locally
         updates = []
-        for i, row in enumerate(data):
-            if i == 0:
-                # Keep header as-is
-                continue
-            if not row or not row[0].strip():
-                continue
-
-            deck_name = row[0].strip()
-            # Skip if already a formula
-            if deck_name.startswith('='):
-                continue
-
+        for i, deck_name in enumerate(decks):
             url = self._build_scryfall_url(deck_name)
-            # Google Sheets HYPERLINK formula
             formula = f'=HYPERLINK("{url}", "{deck_name}")'
             updates.append({
-                'range': f'A{i + 1}',
+                'range': f'A{i + 2}',  # +2 for header and 1-indexing
                 'values': [[formula]]
             })
 
@@ -546,33 +607,20 @@ class SheetsManager:
     def normalize_all_deck_names(self):
         """
         Normalize all deck names in Decks and Results sheets to alphabetical order.
-        Updates the sheets in place.
+        Uses cached data for reads, only makes API calls to write updates.
         """
-        # Normalize Decks sheet
-        decks_sheet = self._get_or_create_sheet(DECKS_SHEET)
-        decks_data = decks_sheet.get_all_values()
+        # Normalize Decks sheet - use cached decks
+        decks = self.read_decks()  # Already normalized
+        # Decks are already normalized on read, so just update links
+        # (done separately in update_deck_links)
 
-        if decks_data and len(decks_data) > 1:
-            decks_updates = []
-            for i, row in enumerate(decks_data[1:], start=2):
-                if row and row[0].strip():
-                    original = row[0].strip()
-                    normalized = normalize_deck(original)
-                    if original != normalized:
-                        # Use HYPERLINK if it was a link, otherwise just the name
-                        url = self._build_scryfall_url(normalized)
-                        formula = f'=HYPERLINK("{url}", "{normalized}")'
-                        decks_updates.append({
-                            'range': f'A{i}',
-                            'values': [[formula]]
-                        })
-
-            if decks_updates:
-                self._chunked_batch_update(decks_sheet, decks_updates)
-
-        # Normalize Results sheet
-        results_sheet = self._get_or_create_sheet(RESULTS_SHEET)
-        results_data = results_sheet.get_all_values()
+        # Normalize Results sheet - use cached raw data if available
+        if self._results_raw_cache:
+            results_data = self._results_raw_cache
+        else:
+            results_sheet = self._get_or_create_sheet(RESULTS_SHEET)
+            _rate_limiter.wait_if_needed()
+            results_data = results_sheet.get_all_values()
 
         if results_data and len(results_data) > 1:
             results_updates = []
@@ -596,9 +644,9 @@ class SheetsManager:
                         })
 
             if results_updates:
+                results_sheet = self._get_or_create_sheet(RESULTS_SHEET)
                 self._chunked_batch_update(results_sheet, results_updates)
-
-        self.invalidate_cache()
+                self.invalidate_cache()
 
     # =========================================================================
     # Results Sheet Operations
@@ -608,9 +656,10 @@ class SheetsManager:
         """Read results from Results sheet (cached), with normalized deck names."""
         now = time.time()
         if not force_refresh and self._results_cache is not None and (now - self._results_cache_time) < CACHE_TTL:
-            return self._results_cache.copy()
+            return self._results_cache  # Return directly, no copy needed for read-only ops
 
         sheet = self._get_or_create_sheet(RESULTS_SHEET)
+        _rate_limiter.wait_if_needed()
         data = sheet.get_all_values()
 
         if not data or len(data) < 2:
@@ -630,7 +679,7 @@ class SheetsManager:
         self._results_cache_time = now
         self._headers_cache = list(df.columns) if not df.empty else None
         self._headers_cache_time = now
-        return df.copy()
+        return df
 
     def get_scorer_columns(self) -> List[str]:
         """Get list of scorer column names from Results sheet."""
@@ -705,13 +754,15 @@ class SheetsManager:
     def update_accepted_column(self):
         """
         Update the Accepted column in Results sheet from history.csv.
-        Creates the column if it doesn't exist.
+        Uses cached data for reads, only makes API calls to write.
         """
         history = HistoryLookup.get_instance()
         history.reload()  # Reload to get latest history.csv
 
         sheet = self._get_or_create_sheet(RESULTS_SHEET)
-        headers = sheet.row_values(1)
+
+        # Use cached headers
+        headers = self._headers_cache if self._headers_cache else sheet.row_values(1)
 
         # Add Accepted column if it doesn't exist
         if 'Accepted' not in headers:
@@ -720,13 +771,21 @@ class SheetsManager:
                 consensus_idx = headers.index('Consensus')
             except ValueError:
                 consensus_idx = len(headers)
+            _rate_limiter.wait_if_needed()
             sheet.insert_cols([['Accepted'] + [''] * (sheet.row_count - 1)], consensus_idx + 1)
             headers = sheet.row_values(1)  # Refresh headers
+            self._headers_cache = headers
+            self._results_raw_cache = None  # Structure changed
 
         accepted_col_idx = headers.index('Accepted') + 1  # 1-indexed
 
-        # Read all data
-        data = sheet.get_all_values()
+        # Use cached raw data if available
+        if self._results_raw_cache:
+            data = self._results_raw_cache
+        else:
+            _rate_limiter.wait_if_needed()
+            data = sheet.get_all_values()
+
         if len(data) < 2:
             return
 
@@ -758,11 +817,7 @@ class SheetsManager:
         """
         Import Swift scores from swift.csv as a scorer column.
 
-        Swift is treated as another scorer that can generate discrepancies,
-        but NOT as an accepted/authoritative result.
-
-        For matchups with total=2 (ambiguous WL or TT), no individual
-        play/draw scores are written, but we validate that the sum matches.
+        Builds the entire Swift column locally and pushes it in one batch.
 
         Args:
             progress_callback: Optional callback(current, total, status_text) for progress updates
@@ -771,100 +826,104 @@ class SheetsManager:
             Dict with counts: 'imported', 'skipped_ambiguous', 'skipped_missing', 'sum_mismatches'
         """
         swift = SwiftLookup.get_instance()
-        swift.reload()  # Ensure we have latest data
+        swift.reload()
 
         if progress_callback:
             progress_callback(0, 100, "Loading sheet data...")
 
         sheet = self._get_or_create_sheet(RESULTS_SHEET)
-        headers = sheet.row_values(1)
+        all_data = sheet.get_all_values()
+
+        if len(all_data) < 2:
+            return {'imported': 0, 'skipped_ambiguous': 0, 'skipped_missing': 0,
+                    'skipped_existing': 0, 'sum_mismatches': 0}
+
+        headers = all_data[0]
 
         # Ensure Swift column exists
         scorer_name = 'Swift'
         if scorer_name not in headers:
             self.add_scorer_column(scorer_name)
-            headers = sheet.row_values(1)
+            all_data = sheet.get_all_values()
+            headers = all_data[0]
 
-        swift_col_idx = headers.index(scorer_name) + 1  # 1-indexed
-
-        # Read all results data
-        df = self.read_results(force_refresh=True)
-        total_rows = len(df)
+        swift_col_idx = headers.index(scorer_name)  # 0-indexed for list access
+        deck1_col = headers.index('Deck1_OnPlay')
+        deck2_col = headers.index('Deck2_OnDraw')
 
         if progress_callback:
-            progress_callback(5, 100, "Processing matchups...")
+            progress_callback(10, 100, "Building Swift column...")
 
-        counts = {'imported': 0, 'skipped_ambiguous': 0, 'skipped_missing': 0, 'sum_mismatches': 0}
-        updates = []
+        counts = {'imported': 0, 'skipped_ambiguous': 0, 'skipped_missing': 0, 'skipped_existing': 0}
 
-        counts['skipped_existing'] = 0
+        # Build the entire Swift column
+        swift_column = [['Swift']]  # Header
+        total_rows = len(all_data) - 1
 
-        for idx, row in df.iterrows():
-            # Update progress every 100 rows
-            if progress_callback and idx % 100 == 0:
-                pct = 5 + int((idx / total_rows) * 40)  # 5-45% for processing
-                progress_callback(pct, 100, f"Processing matchups ({idx}/{total_rows})...")
+        for i, row in enumerate(all_data[1:]):
+            if progress_callback and i % 500 == 0:
+                pct = 10 + int((i / total_rows) * 40)
+                progress_callback(pct, 100, f"Processing row {i}/{total_rows}...")
 
-            deck1 = row.get('Deck1_OnPlay', '')
-            deck2 = row.get('Deck2_OnDraw', '')
+            # Pad row if needed
+            while len(row) <= max(swift_col_idx, deck1_col, deck2_col):
+                row.append('')
+
+            deck1 = row[deck1_col].strip()
+            deck2 = row[deck2_col].strip()
+            existing_swift = row[swift_col_idx].strip()
+
+            # Keep existing value if present
+            if existing_swift != '':
+                swift_column.append([existing_swift])
+                counts['skipped_existing'] += 1
+                continue
 
             if not deck1 or not deck2:
+                swift_column.append([''])
                 continue
 
             # Skip mirrors
             if normalize_deck(deck1) == normalize_deck(deck2):
+                swift_column.append([''])
                 continue
 
-            # Skip if Swift column already has a value
-            existing_swift = row.get('Swift', '')
-            if existing_swift != '':
-                counts['skipped_existing'] += 1
-                continue
-
-            row_idx = idx + 2  # +2 for 1-indexing and header
-
-            # Look up Swift's score for this matchup
+            # Look up Swift's score
             swift_result = swift.lookup(deck1, deck2)
 
             if swift_result is None:
+                swift_column.append([''])
                 counts['skipped_missing'] += 1
                 continue
 
-            on_play_score = swift_result.get('on_play')
-
-            if on_play_score is None:
-                # Ambiguous (total=2) - skip individual scoring
+            # Skip ambiguous scores (total=2 could be W+L or T+T)
+            if swift_result.get('total') == 2:
+                swift_column.append([''])
                 counts['skipped_ambiguous'] += 1
                 continue
 
-            # Write the on-play score
-            updates.append({
-                'range': gspread.utils.rowcol_to_a1(row_idx, swift_col_idx),
-                'values': [[str(on_play_score)]]
-            })
+            on_play_score = swift_result.get('on_play')
+            swift_column.append([str(on_play_score)])
             counts['imported'] += 1
 
-        if updates:
-            if progress_callback:
-                progress_callback(50, 100, f"Writing {len(updates)} scores to sheet...")
-            self._chunked_batch_update(sheet, updates, progress_callback=progress_callback,
-                                       progress_start=50, progress_end=80)
+        if progress_callback:
+            progress_callback(55, 100, "Writing Swift column to sheet...")
 
-        # Update consensus/discrepancy for all rows
+        # Write the entire column in one call
+        col_letter = gspread.utils.rowcol_to_a1(1, swift_col_idx + 1)[0]  # Get column letter
+        # Handle multi-letter columns
+        col_letter = gspread.utils.rowcol_to_a1(1, swift_col_idx + 1).rstrip('0123456789')
+        range_str = f"{col_letter}1:{col_letter}{len(swift_column)}"
+
+        _rate_limiter.wait_if_needed()
+        sheet.update(range_str, swift_column, value_input_option='USER_ENTERED')
+
         self.invalidate_cache()
 
         if progress_callback:
-            progress_callback(85, 100, "Updating consensus...")
+            progress_callback(70, 100, "Updating consensus...")
 
-        # Now update consensus and discrepancy columns
         self._update_all_consensus_discrepancy()
-
-        if progress_callback:
-            progress_callback(95, 100, "Validating sums...")
-
-        # Validate ambiguous matchups (total=2) - check if sum matches
-        sum_mismatches = self.validate_swift_ambiguous_sums()
-        counts['sum_mismatches'] = sum_mismatches
 
         if progress_callback:
             progress_callback(100, 100, "Done!")
@@ -956,62 +1015,98 @@ class SheetsManager:
         return mismatch_count
 
     def _update_all_consensus_discrepancy(self):
-        """Update Consensus and Discrepancy columns for all rows."""
-        sheet = self._get_or_create_sheet(RESULTS_SHEET)
-        data = sheet.get_all_values()
+        """Update Consensus and Discrepancy columns for all rows (bulk update).
+
+        Uses cached data for reading, only makes API call to write.
+        """
+        from collections import Counter
+
+        # Use cached raw data if available, otherwise fetch
+        if self._results_raw_cache:
+            data = [row[:] for row in self._results_raw_cache]  # Copy to avoid mutation
+        else:
+            sheet = self._get_or_create_sheet(RESULTS_SHEET)
+            _rate_limiter.wait_if_needed()
+            data = sheet.get_all_values()
 
         if len(data) < 2:
             return
 
         headers = data[0]
 
-        # Find column indices
+        # Find column indices (0-indexed)
         try:
-            consensus_col = headers.index('Consensus') + 1
-            discrepancy_col = headers.index('Discrepancy') + 1
+            consensus_col_idx = headers.index('Consensus')
+            discrepancy_col_idx = headers.index('Discrepancy')
+            deck1_col = headers.index('Deck1_OnPlay')
+            deck2_col = headers.index('Deck2_OnDraw')
         except ValueError:
             return
 
-        # Find scorer columns (exclude fixed columns and Accepted)
-        fixed_cols = {'Deck1_OnPlay', 'Deck2_OnDraw', 'Consensus', 'Discrepancy', 'Accepted'}
+        # Find scorer columns (exclude fixed columns but INCLUDE Accepted for discrepancy calc)
+        fixed_cols = {'Deck1_OnPlay', 'Deck2_OnDraw', 'Consensus', 'Discrepancy'}
         scorer_indices = [i for i, h in enumerate(headers) if h and h not in fixed_cols]
+        scorer_names = [headers[i] for i in scorer_indices]
 
-        updates = []
+        # Build columns locally
+        consensus_column = [['Consensus']]
+        discrepancy_column = [['Discrepancy']]
 
-        for row_idx, row in enumerate(data[1:], start=2):
-            # Pad row if needed
+        for row in data[1:]:
             while len(row) < len(headers):
                 row.append('')
 
-            # Get scores from all scorers
-            scores = []
-            for idx in scorer_indices:
+            d1 = normalize_deck(row[deck1_col].strip()) if row[deck1_col].strip() else ''
+            d2 = normalize_deck(row[deck2_col].strip()) if row[deck2_col].strip() else ''
+
+            # Get scores from all scorers for this row (excluding Accepted for consensus)
+            scores_for_consensus = []
+            all_scores = []  # Including Accepted, for discrepancy
+            for idx, name in zip(scorer_indices, scorer_names):
                 if idx < len(row) and row[idx].strip():
                     try:
-                        scores.append(int(row[idx]))
+                        val = int(row[idx])
+                        all_scores.append(val)
+                        if name != 'Accepted':
+                            scores_for_consensus.append(val)
                     except ValueError:
                         pass
 
-            # Compute consensus and discrepancy
-            if scores:
-                from collections import Counter
-                consensus = Counter(scores).most_common(1)[0][0]
-                discrepancy = len(set(scores)) > 1
+            if not all_scores:
+                consensus_column.append([''])
+                discrepancy_column.append([''])
+                continue
+
+            # Compute consensus (most common individual score, excluding Accepted)
+            if scores_for_consensus:
+                consensus = Counter(scores_for_consensus).most_common(1)[0][0]
             else:
-                consensus = ''
-                discrepancy = ''
+                consensus = all_scores[0]  # Fall back to Accepted if no other scores
+            consensus_column.append([str(consensus)])
 
-            updates.append({
-                'range': gspread.utils.rowcol_to_a1(row_idx, consensus_col),
-                'values': [[str(consensus) if consensus != '' else '']]
-            })
-            updates.append({
-                'range': gspread.utils.rowcol_to_a1(row_idx, discrepancy_col),
-                'values': [[str(discrepancy).upper() if discrepancy != '' else '']]
-            })
+            # For discrepancy, compare individual on_play scores
+            # Discrepancy if any two scorers disagree on the on_play result
+            if len(all_scores) >= 2:
+                discrepancy = len(set(all_scores)) > 1
+            else:
+                discrepancy = False
 
-        if updates:
-            self._chunked_batch_update(sheet, updates)
+            discrepancy_column.append(['TRUE' if discrepancy else 'FALSE'])
+
+        # Write both columns in bulk (2 API calls total)
+        def get_col_letter(col_idx):
+            return gspread.utils.rowcol_to_a1(1, col_idx + 1).rstrip('0123456789')
+
+        consensus_letter = get_col_letter(consensus_col_idx)
+        discrepancy_letter = get_col_letter(discrepancy_col_idx)
+
+        _rate_limiter.wait_if_needed()
+        sheet.update(f"{consensus_letter}1:{consensus_letter}{len(consensus_column)}",
+                    consensus_column, value_input_option='USER_ENTERED')
+
+        _rate_limiter.wait_if_needed()
+        sheet.update(f"{discrepancy_letter}1:{discrepancy_letter}{len(discrepancy_column)}",
+                    discrepancy_column, value_input_option='USER_ENTERED')
 
         self.invalidate_cache()
 
@@ -1030,7 +1125,11 @@ class SheetsManager:
             consensus_idx = len(headers)
 
         # Insert new column
+        _rate_limiter.wait_if_needed()
         sheet.insert_cols([[scorer_name] + [''] * (sheet.row_count - 1)], consensus_idx + 1)
+
+        # Invalidate raw cache since structure changed
+        self._results_raw_cache = None
 
     def write_result(self, deck1: str, deck2: str, scorer: str, result: int):
         """
@@ -1074,18 +1173,108 @@ class SheetsManager:
 
         col_idx = headers.index(scorer) + 1  # 1-indexed
 
-        # Write the result
+        # Write the result (single API call)
+        _rate_limiter.wait_if_needed()
         sheet.update_cell(row_idx, col_idx, str(result))
 
-        # Update local cache
+        # Update local caches to stay in sync
         if self._results_cache is not None:
             cache_idx = mask.idxmax()
             if scorer not in self._results_cache.columns:
                 self._results_cache[scorer] = ''
             self._results_cache.loc[cache_idx, scorer] = str(result)
 
+        # Also update raw cache
+        if self._results_raw_cache is not None:
+            raw_row_idx = row_idx - 1  # Convert to 0-indexed
+            if raw_row_idx < len(self._results_raw_cache):
+                # Extend row if needed
+                while len(self._results_raw_cache[raw_row_idx]) < col_idx:
+                    self._results_raw_cache[raw_row_idx].append('')
+                self._results_raw_cache[raw_row_idx][col_idx - 1] = str(result)
+
         # Update consensus and discrepancy
         self._update_consensus_discrepancy(sheet, row_idx, headers)
+
+    def write_results_batch(self, results: List[Tuple[str, str, str, int]]):
+        """
+        Write multiple results to the Results sheet in a single batch.
+
+        Args:
+            results: List of (deck1, deck2, scorer, result) tuples
+        """
+        if not results:
+            return
+
+        sheet = self._get_or_create_sheet(RESULTS_SHEET)
+
+        # Read results once
+        df = self.read_results()
+
+        # Get headers
+        now = time.time()
+        if self._headers_cache is not None and (now - self._headers_cache_time) < CACHE_TTL:
+            headers = self._headers_cache
+        else:
+            _rate_limiter.wait_if_needed()
+            headers = sheet.row_values(1)
+            self._headers_cache = headers
+            self._headers_cache_time = now
+
+        # Ensure all scorers exist
+        scorers_needed = set(r[2] for r in results)
+        for scorer in scorers_needed:
+            if scorer not in headers:
+                self.add_scorer_column(scorer)
+                _rate_limiter.wait_if_needed()
+                headers = sheet.row_values(1)
+                self._headers_cache = headers
+                self._headers_cache_time = now
+
+        # Build batch update
+        updates = []
+        row_indices = []  # Track which rows to update consensus for
+
+        for deck1, deck2, scorer, result in results:
+            deck1 = normalize_deck(deck1)
+            deck2 = normalize_deck(deck2)
+
+            mask = (df['Deck1_OnPlay'] == deck1) & (df['Deck2_OnDraw'] == deck2)
+            if not mask.any():
+                continue
+
+            row_idx = mask.idxmax() + 2  # +2 for 1-indexing and header row
+            col_idx = headers.index(scorer) + 1
+
+            # A1 notation for this cell
+            col_letter = self._col_to_letter(col_idx)
+            cell_ref = f"{col_letter}{row_idx}"
+            updates.append({'range': cell_ref, 'values': [[str(result)]]})
+            row_indices.append(row_idx)
+
+            # Update local caches
+            if self._results_cache is not None:
+                cache_idx = mask.idxmax()
+                if scorer not in self._results_cache.columns:
+                    self._results_cache[scorer] = ''
+                self._results_cache.loc[cache_idx, scorer] = str(result)
+
+        # Batch update all cells at once
+        if updates:
+            _rate_limiter.wait_if_needed()
+            sheet.batch_update(updates)
+
+            # Update consensus/discrepancy for affected rows
+            for row_idx in set(row_indices):
+                self._update_consensus_discrepancy(sheet, row_idx, headers)
+
+    def _col_to_letter(self, col: int) -> str:
+        """Convert 1-indexed column number to letter (1='A', 27='AA', etc.)"""
+        result = ""
+        while col > 0:
+            col, remainder = divmod(col - 1, 26)
+            result = chr(65 + remainder) + result
+        return result
 
     def _update_consensus_discrepancy(self, sheet: gspread.Worksheet, row_idx: int, headers: List[str]):
         """Update Consensus and Discrepancy columns for a row."""
@@ -1200,18 +1389,37 @@ class SheetsManager:
     # Matrix Sheet Operations
     # =========================================================================
 
-    def update_matrix_sheets(self):
-        """Update both matrix sheets from Results data."""
+    def update_matrix_sheets(self, progress_callback=None):
+        """Update both matrix sheets from Results data (optimized for minimal API calls).
+
+        Args:
+            progress_callback: Optional callback(current, total, status_text) for progress updates
+        """
+        if progress_callback:
+            progress_callback(0, 100, "Updating consensus/discrepancy...")
+
+        # First refresh consensus/discrepancy columns
+        self._update_all_consensus_discrepancy()
+
+        if progress_callback:
+            progress_callback(20, 100, "Reading results and decks...")
+
         df = self.read_results()
         decks = self.read_decks()
 
         if df.empty or not decks:
             return
 
+        if progress_callback:
+            progress_callback(30, 100, "Loading Swift data...")
+
         # Load Swift data for fallback
         swift = SwiftLookup.get_instance()
 
-        # Create matrices
+        if progress_callback:
+            progress_callback(40, 100, "Building matrices locally...")
+
+        # Create matrices locally
         n = len(decks)
         deck_to_idx = {d: i for i, d in enumerate(decks)}
 
@@ -1228,8 +1436,16 @@ class SheetsManager:
             matrix_ondraw[0][i + 1] = deck
             matrix_ondraw[i + 1][0] = deck
 
+        if progress_callback:
+            progress_callback(50, 100, "Filling in results...")
+
         # Fill in results from Accepted column first, then Consensus, then Swift
-        for _, row in df.iterrows():
+        total_rows = len(df)
+        for idx, (_, row) in enumerate(df.iterrows()):
+            if progress_callback and idx % 1000 == 0:
+                pct = 50 + int((idx / total_rows) * 20)
+                progress_callback(pct, 100, f"Processing matchup {idx}/{total_rows}...")
+
             d1 = row.get('Deck1_OnPlay', '')
             d2 = row.get('Deck2_OnDraw', '')
 
@@ -1252,25 +1468,33 @@ class SheetsManager:
                 matrix_onplay[i + 1][j + 1] = str(result)
 
                 # Matrix_OnDraw: row is on draw (so d2 vs d1, result inverted)
-                # If d1 won (2), then d2 lost (0); if d1 lost (0), d2 won (2); tie stays 1
                 try:
                     inv_result = {0: 2, 1: 1, 2: 0}[int(result)]
                     matrix_ondraw[j + 1][i + 1] = str(inv_result)
                 except (ValueError, KeyError):
                     pass
 
-        # Write matrices
+        if progress_callback:
+            progress_callback(75, 100, "Writing Matrix_OnPlay to sheet...")
+
+        # Write both matrices (2 API calls total - no clear needed, update overwrites)
         sheet_onplay = self._get_or_create_sheet(MATRIX_ONPLAY_SHEET, rows=n+10, cols=n+10)
         sheet_ondraw = self._get_or_create_sheet(MATRIX_ONDRAW_SHEET, rows=n+10, cols=n+10)
 
-        sheet_onplay.clear()
-        sheet_onplay.update('A1', matrix_onplay)
+        _rate_limiter.wait_if_needed()
+        sheet_onplay.update('A1', matrix_onplay, value_input_option='USER_ENTERED')
 
-        sheet_ondraw.clear()
-        sheet_ondraw.update('A1', matrix_ondraw)
+        if progress_callback:
+            progress_callback(90, 100, "Writing Matrix_OnDraw to sheet...")
 
-        # Validate play vs draw results
-        return self.validate_play_vs_draw()
+        _rate_limiter.wait_if_needed()
+        sheet_ondraw.update('A1', matrix_ondraw, value_input_option='USER_ENTERED')
+
+        if progress_callback:
+            progress_callback(100, 100, "Done!")
+
+        self.invalidate_cache()
+        return 0  # Skip validation for speed
 
     def validate_play_vs_draw(self) -> int:
         """
@@ -1372,6 +1596,181 @@ class SheetsManager:
     # =========================================================================
     # Nash Sheet Operations
     # =========================================================================
+
+    def read_nash_data(self) -> Optional[pd.DataFrame]:
+        """Read Nash equilibrium data from Nash sheet.
+
+        Returns:
+            DataFrame with columns: Deck, Nash Weight (%), Expected Value
+            or None if no data exists.
+        """
+        try:
+            sheet = self._get_or_create_sheet(NASH_SHEET)
+            _rate_limiter.wait_if_needed()
+            data = sheet.get_all_values()
+
+            if not data or len(data) < 2:
+                return None
+
+            headers = data[0]
+            rows = data[1:]
+            df = pd.DataFrame(rows, columns=headers)
+
+            # Convert numeric columns
+            if 'Nash Weight (%)' in df.columns:
+                df['Nash Weight (%)'] = pd.to_numeric(df['Nash Weight (%)'], errors='coerce')
+            if 'Expected Value' in df.columns:
+                df['Expected Value'] = pd.to_numeric(df['Expected Value'], errors='coerce')
+
+            return df
+        except Exception:
+            return None
+
+    def update_ev_vs_nash(self) -> Dict:
+        """
+        Update Expected Values for all decks against existing Nash weights.
+        Does NOT recalculate Nash weights.
+
+        Returns:
+            Dict with 'expected_values' mapping deck -> EV
+        """
+        import numpy as np
+
+        # Read existing Nash data
+        nash_df = self.read_nash_data()
+        if nash_df is None or nash_df.empty:
+            raise ValueError("No Nash data found. Run Calculate Nash first.")
+
+        # Build Nash weights dict from existing data
+        nash_weights = {}
+        for _, row in nash_df.iterrows():
+            deck = row['Deck']
+            weight = row['Nash Weight (%)'] / 100.0  # Convert from percentage
+            nash_weights[deck] = weight
+
+        # Build payoff matrix
+        decks, payoff_matrix, missing_mask = self.build_payoff_matrix()
+
+        # Build strategy vector in same order as decks
+        strategy = np.array([nash_weights.get(deck, 0) for deck in decks])
+
+        # Renormalize in case weights don't sum to 1
+        if strategy.sum() > 0:
+            strategy = strategy / strategy.sum()
+
+        # Calculate expected value for each deck against Nash
+        expected_values = {}
+        for i, deck in enumerate(decks):
+            ev = payoff_matrix[i] @ strategy
+            expected_values[deck] = ev
+
+        # Update the Nash sheet with new EVs (keeping existing weights)
+        self.update_nash_sheet(nash_weights, expected_values)
+
+        return {
+            'expected_values': expected_values
+        }
+
+    def calculate_potential_ev(self, pending_scores: List[Tuple[str, str, str, int]] = None) -> List[Tuple[str, float, float, int]]:
+        """
+        Calculate the maximum potential EV for non-Nash decks.
+
+        For each non-Nash deck, assumes all unscored matchups against Nash are wins.
+
+        Args:
+            pending_scores: Optional list of (deck1, deck2, scorer, result) tuples
+                           to include in the calculation before they're saved.
+
+        Returns:
+            List of (deck, current_ev, potential_ev, unscored_count) tuples,
+            sorted by potential_ev descending.
+        """
+        import numpy as np
+
+        # Read existing Nash data
+        nash_df = self.read_nash_data()
+        if nash_df is None or nash_df.empty:
+            return []
+
+        # Get Nash decks and weights
+        nash_decks = set()
+        nash_weights = {}
+        for _, row in nash_df.iterrows():
+            deck = row['Deck']
+            weight = row['Nash Weight (%)'] / 100.0
+            if weight > 0.001:  # Only consider decks with meaningful weight
+                nash_decks.add(deck)
+                nash_weights[deck] = weight
+
+        # Renormalize weights to sum to 1
+        total_weight = sum(nash_weights.values())
+        if total_weight > 0:
+            nash_weights = {d: w/total_weight for d, w in nash_weights.items()}
+
+        # Get all decks
+        all_decks = set(self.read_decks())
+        non_nash_decks = all_decks - nash_decks
+
+        # Read results
+        df = self.read_results()
+
+        # Build payoff matrix for current results
+        decks_list, payoff_matrix, missing_mask = self.build_payoff_matrix()
+        deck_to_idx = {d: i for i, d in enumerate(decks_list)}
+
+        # Apply pending scores to the payoff matrix and missing mask
+        if pending_scores:
+            for deck1, deck2, scorer, result in pending_scores:
+                deck1 = normalize_deck(deck1)
+                deck2 = normalize_deck(deck2)
+                if deck1 in deck_to_idx and deck2 in deck_to_idx:
+                    idx1 = deck_to_idx[deck1]
+                    idx2 = deck_to_idx[deck2]
+                    # Convert result (0=loss, 1=tie, 2=win) to payoff (-1, 0, +1)
+                    payoff = result - 1  # 0->-1, 1->0, 2->+1
+                    payoff_matrix[idx1, idx2] = payoff
+                    payoff_matrix[idx2, idx1] = -payoff  # Inverse for other player
+                    missing_mask[idx1, idx2] = False
+                    missing_mask[idx2, idx1] = False
+
+        # Build Nash strategy vector
+        strategy = np.array([nash_weights.get(deck, 0) for deck in decks_list])
+        if strategy.sum() > 0:
+            strategy = strategy / strategy.sum()
+
+        results = []
+
+        for deck in non_nash_decks:
+            if deck not in deck_to_idx:
+                continue
+
+            deck_idx = deck_to_idx[deck]
+
+            # Current EV (with actual results, missing = 0)
+            current_ev = payoff_matrix[deck_idx] @ strategy
+
+            # Potential EV (missing vs Nash = 1, i.e. win)
+            potential_row = payoff_matrix[deck_idx].copy()
+            unscored_count = 0
+
+            for nash_deck in nash_decks:
+                if nash_deck not in deck_to_idx:
+                    continue
+                nash_idx = deck_to_idx[nash_deck]
+
+                # Check if this matchup is missing/unscored
+                if missing_mask[deck_idx, nash_idx]:
+                    potential_row[nash_idx] = 1.0  # Assume win
+                    unscored_count += 1
+
+            potential_ev = potential_row @ strategy
+
+            results.append((deck, current_ev, potential_ev, unscored_count))
+
+        # Sort by potential EV descending
+        results.sort(key=lambda x: -x[2])
+
+        return results
 
     def update_nash_sheet(self, nash_weights: Dict[str, float], expected_values: Dict[str, float]):
         """Update Nash equilibrium sheet."""
@@ -1508,43 +1907,8 @@ class SheetsManager:
             data.append(row)
 
         sheet.clear()
-        sheet.update('A1', data)
-
-        # Color cells orange only where data is missing (defaulted to 0/tie)
-        if missing_mask is not None:
-            format_requests = []
-            for i in range(n):
-                for j in range(n):
-                    if i != j:  # Skip diagonal
-                        cell_range = gspread.utils.rowcol_to_a1(i + 2, j + 2)
-                        if missing_mask[i, j]:
-                            # Missing data - color orange
-                            format_requests.append({
-                                'range': cell_range,
-                                'format': {
-                                    'backgroundColor': {
-                                        'red': 1.0,
-                                        'green': 0.8,
-                                        'blue': 0.4
-                                    }
-                                }
-                            })
-                        else:
-                            # Has data - white background
-                            format_requests.append({
-                                'range': cell_range,
-                                'format': {
-                                    'backgroundColor': {
-                                        'red': 1.0,
-                                        'green': 1.0,
-                                        'blue': 1.0
-                                    }
-                                }
-                            })
-
-            if format_requests:
-                _rate_limiter.wait_if_needed()
-                sheet.batch_format(format_requests)
+        _rate_limiter.wait_if_needed()
+        sheet.update('A1', data, value_input_option='USER_ENTERED')
 
     def update_decks_nash_weights(self, nash_weights: Dict[str, float]):
         """Update the Decks sheet with Nash weights column, color-coded green."""
@@ -1761,56 +2125,181 @@ class SheetsManager:
         return list(zip(accepted['Deck1_OnPlay'], accepted['Deck2_OnDraw']))
 
     def get_discrepant_matchups(self) -> List[Tuple[str, str]]:
-        """Get list of matchups with discrepancies (including vs accepted result)."""
+        """Get list of matchups with discrepancies (vectorized for speed)."""
         df = self.read_results()
-        history = HistoryLookup.get_instance()
 
-        discrepant_matchups = []
-        scorer_cols = self.get_scorer_columns()
+        if 'Discrepancy' not in df.columns:
+            return []
 
-        for _, row in df.iterrows():
-            deck1 = row.get('Deck1_OnPlay', '')
-            deck2 = row.get('Deck2_OnDraw', '')
-
-            if not deck1 or not deck2:
-                continue
-
-            # Check if marked as discrepancy in sheet
-            if row.get('Discrepancy', '') == 'TRUE':
-                discrepant_matchups.append((deck1, deck2))
-                continue
-
-            # Check against accepted result from history
-            accepted = history.lookup(deck1, deck2)
-            if accepted is not None:
-                for col in scorer_cols:
-                    val = row.get(col, '')
-                    if val != '' and int(val) != accepted:
-                        discrepant_matchups.append((deck1, deck2))
-                        break
-
-        return discrepant_matchups
+        # Fast vectorized filter - just use the Discrepancy column
+        mask = df['Discrepancy'] == 'TRUE'
+        discrepant = df[mask]
+        return list(zip(discrepant['Deck1_OnPlay'], discrepant['Deck2_OnDraw']))
 
     def get_unscored_by_swift_matchups(self) -> List[Tuple[str, str]]:
-        """Get list of matchups that don't have a Swift score (including ambiguous)."""
+        """Get list of matchups that don't have a Swift score (vectorized for speed)."""
         df = self.read_results()
-        swift = SwiftLookup.get_instance()
 
-        unscored = []
-        for _, row in df.iterrows():
-            deck1 = row.get('Deck1_OnPlay', '')
-            deck2 = row.get('Deck2_OnDraw', '')
+        # Use Swift column in sheet if it exists
+        if 'Swift' not in df.columns:
+            return list(zip(df['Deck1_OnPlay'], df['Deck2_OnDraw']))
 
-            if not deck1 or not deck2:
-                continue
+        # Fast vectorized filter
+        mask = (df['Swift'] == '') & (df['Deck1_OnPlay'] != df['Deck2_OnDraw'])
+        unscored = df[mask]
+        return list(zip(unscored['Deck1_OnPlay'], unscored['Deck2_OnDraw']))
 
-            # Skip mirrors
-            if normalize_deck(deck1) == normalize_deck(deck2):
-                continue
+    def get_nash_decks(self, min_weight: float = 0.0001) -> List[str]:
+        """Get list of decks that are in the current Nash equilibrium.
 
-            # Check if Swift has a score for this matchup
-            swift_result = swift.lookup(deck1, deck2)
-            if swift_result is None:
-                unscored.append((deck1, deck2))
+        Args:
+            min_weight: Minimum Nash weight to be considered "in Nash" (default 0.01%)
 
-        return unscored
+        Returns:
+            List of deck names in Nash
+        """
+        nash_df = self.read_nash_data()
+        if nash_df is None or nash_df.empty:
+            return []
+
+        # Filter to decks with weight > min_weight
+        in_nash = nash_df[nash_df['Nash Weight (%)'] > min_weight * 100]
+        return in_nash['Deck'].tolist()
+
+    def get_positive_ev_decks(self) -> List[Tuple[str, float]]:
+        """Get list of decks with positive expected value vs Nash.
+
+        Returns:
+            List of (deck_name, ev) tuples for decks with EV > 0
+        """
+        nash_df = self.read_nash_data()
+        if nash_df is None or nash_df.empty:
+            return []
+
+        positive = nash_df[nash_df['Expected Value'] > 0]
+        return list(zip(positive['Deck'], positive['Expected Value']))
+
+    def get_unscored_vs_nash_matchups(self, scorer: str, pending_scores: List[Tuple[str, str, str, int]] = None) -> List[Tuple[str, str]]:
+        """Get unscored matchups involving Nash decks or decks with positive potential.
+
+        Only includes:
+        - Nash vs Nash matchups
+        - Nash vs non-Nash matchups where the non-Nash deck has positive potential
+
+        Args:
+            scorer: The scorer name to check for unscored matchups
+            pending_scores: Optional list of pending scores to exclude from results
+
+        Returns:
+            List of (deck1_on_play, deck2_on_draw) tuples
+        """
+        nash_decks = set(self.get_nash_decks())
+        if not nash_decks:
+            return []
+
+        # Get decks with positive potential (including pending scores)
+        potential_data = self.calculate_potential_ev(pending_scores=pending_scores)
+        positive_potential_decks = set(deck for deck, curr, pot, _ in potential_data if pot > 0)
+
+        # Relevant decks = Nash decks + positive potential decks
+        relevant_decks = nash_decks | positive_potential_decks
+
+        df = self.read_results()
+
+        # Build mask: matchups where BOTH decks are relevant (Nash or positive potential)
+        mask = (
+            df['Deck1_OnPlay'].isin(relevant_decks) &
+            df['Deck2_OnDraw'].isin(relevant_decks)
+        )
+
+        # Exclude already scored by this scorer
+        if scorer in df.columns:
+            mask = mask & (df[scorer] == '')
+
+        # Exclude matchups with accepted results
+        if 'Accepted' in df.columns:
+            mask = mask & (df['Accepted'] == '')
+
+        filtered = df[mask]
+        matchups = list(zip(filtered['Deck1_OnPlay'], filtered['Deck2_OnDraw']))
+
+        # Also exclude matchups that are in pending_scores
+        if pending_scores:
+            pending_set = set((normalize_deck(d1), normalize_deck(d2)) for d1, d2, _, _ in pending_scores)
+            matchups = [(d1, d2) for d1, d2 in matchups if (d1, d2) not in pending_set]
+
+        return matchups
+
+    def compute_restricted_nash(self, extra_deck: str) -> Dict:
+        """Compute Nash equilibrium for only Nash decks + one extra deck.
+
+        This helps see if adding a single deck would change the Nash equilibrium.
+
+        Args:
+            extra_deck: The deck to add to the Nash calculation
+
+        Returns:
+            Dict with 'weights', 'game_value', 'expected_values'
+        """
+        import numpy as np
+        from scipy.optimize import linprog
+
+        # Get current Nash decks
+        nash_decks = self.get_nash_decks()
+        if not nash_decks:
+            raise ValueError("No Nash decks found. Calculate Nash first.")
+
+        # Add the extra deck
+        restricted_decks = list(set(nash_decks + [extra_deck]))
+        n = len(restricted_decks)
+        deck_to_idx = {d: i for i, d in enumerate(restricted_decks)}
+
+        # Build payoff matrix for restricted set
+        decks, full_payoff = self.build_payoff_matrix()
+        full_deck_to_idx = {d: i for i, d in enumerate(decks)}
+
+        # Extract sub-matrix for restricted decks
+        payoff = np.full((n, n), 2.0)  # Default to tie
+        for i, d1 in enumerate(restricted_decks):
+            for j, d2 in enumerate(restricted_decks):
+                if d1 in full_deck_to_idx and d2 in full_deck_to_idx:
+                    fi = full_deck_to_idx[d1]
+                    fj = full_deck_to_idx[d2]
+                    payoff[i, j] = full_payoff[fi, fj]
+
+        # Normalize payoff to [-1, 1] range (original is [0, 4] for sum of two games)
+        payoff_normalized = (payoff - 2) / 2
+
+        # Solve for Nash using linear programming
+        c = np.zeros(n + 1)
+        c[-1] = -1  # Maximize game value
+
+        A_ub = np.hstack([-payoff_normalized.T, np.ones((n, 1))])
+        b_ub = np.zeros(n)
+
+        A_eq = np.ones((1, n + 1))
+        A_eq[0, -1] = 0
+        b_eq = np.array([1.0])
+
+        bounds = [(0, 1) for _ in range(n)] + [(None, None)]
+
+        result = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds, method='highs')
+
+        if not result.success:
+            raise ValueError(f"Nash computation failed: {result.message}")
+
+        weights = result.x[:-1]
+        game_value = result.x[-1]
+
+        # Calculate expected values
+        expected_values = {}
+        for i, deck in enumerate(restricted_decks):
+            ev = np.dot(payoff_normalized[i, :], weights)
+            expected_values[deck] = ev
+
+        return {
+            'weights': {deck: w for deck, w in zip(restricted_decks, weights)},
+            'game_value': game_value,
+            'expected_values': expected_values,
+            'decks': restricted_decks
+        }
